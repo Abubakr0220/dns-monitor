@@ -1,0 +1,13 @@
+# Сборка
+build/
+out/
+.vs/
+*.sln
+*.vcxproj*
+
+# Временные файлы
+*.log
+*.tmp
+
+# Черновики агента (чтобы не пушить их на GitHub)
+architecture_docs/
