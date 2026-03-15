@@ -249,6 +249,9 @@ namespace MonitoringCore
         private bool _initialized = false;
         private bool _disposed    = false;
 
+        // ── DNS Proxy (C# замена MinHook-перехвата DNS) ──────────────────────
+        private LocalDnsProxy _dnsProxy;
+
         // ── Публичное событие ────────────────────────────────────────────────
         /// <summary>
         /// Срабатывает при каждом событии из C++ модулей (DNS или USB).
@@ -300,56 +303,71 @@ namespace MonitoringCore
             if (config == null)
                 throw new ArgumentNullException(nameof(config));
 
-            // ── Ручной маршаллинг SessionConfig → нативную структуру ────────
-            // C++ SessionConfig содержит char** — массив указателей на ANSI-строки.
-            // Автоматический маршаллинг через [StructLayout] здесь не работает,
-            // поэтому собираем нативный блок памяти вручную.
-
-            string[] whitelist     = config.DnsWhitelist ?? Array.Empty<string>();
-            int      whitelistCount = whitelist.Length;
-
-            // Выделяем массив указателей на строки (char*[])
-            IntPtr[] strPointers = new IntPtr[whitelistCount];
-            for (int i = 0; i < whitelistCount; i++)
+            // ── Шаг A: Запуск C++ модуля USB через P/Invoke ─────────────────
+            // Маршаллим конфигурацию для C++ (USB-мониторинг остаётся в DLL)
             {
-                // Marshal.StringToHGlobalAnsi выделяет ANSI-строку в неуправляемой памяти
-                strPointers[i] = Marshal.StringToHGlobalAnsi(whitelist[i] ?? string.Empty);
-            }
+                string[] whitelist      = config.DnsWhitelist ?? Array.Empty<string>();
+                int      whitelistCount = whitelist.Length;
 
-            // Выделяем массив указателей (char**)
-            IntPtr ppStrings = IntPtr.Zero;
-            if (whitelistCount > 0)
-            {
-                ppStrings = Marshal.AllocHGlobal(IntPtr.Size * whitelistCount);
+                IntPtr[] strPointers = new IntPtr[whitelistCount];
                 for (int i = 0; i < whitelistCount; i++)
+                    strPointers[i] = Marshal.StringToHGlobalAnsi(whitelist[i] ?? string.Empty);
+
+                IntPtr ppStrings = IntPtr.Zero;
+                if (whitelistCount > 0)
                 {
-                    Marshal.WriteIntPtr(ppStrings, i * IntPtr.Size, strPointers[i]);
+                    ppStrings = Marshal.AllocHGlobal(IntPtr.Size * whitelistCount);
+                    for (int i = 0; i < whitelistCount; i++)
+                        Marshal.WriteIntPtr(ppStrings, i * IntPtr.Size, strPointers[i]);
+                }
+
+                IntPtr configPtr = Marshal.AllocHGlobal(IntPtr.Size + 4 + 4);
+                try
+                {
+                    Marshal.WriteIntPtr(configPtr, 0, ppStrings);
+                    Marshal.WriteInt32(configPtr, IntPtr.Size, whitelistCount);
+                    Marshal.WriteInt32(configPtr, IntPtr.Size + 4, (int)config.UsbPolicy);
+
+                    // C++ DLL теперь используется только для USB-модуля,
+                    // но вызов StartSession по-прежнему нужен для обратной совместимости
+                    NativeApi.StartSession(configPtr);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(configPtr);
+                    if (ppStrings != IntPtr.Zero)
+                        Marshal.FreeHGlobal(ppStrings);
+                    foreach (IntPtr p in strPointers)
+                        Marshal.FreeHGlobal(p);
                 }
             }
 
-            // Заполняем нативную структуру SessionConfig вручную:
-            // struct SessionConfig { char** dnsWhitelist; int dnsWhitelistCount; int usbPolicy; }
-            // Размер: IntPtr.Size + 4 + 4 = 16 байт на x64
-            IntPtr configPtr = Marshal.AllocHGlobal(IntPtr.Size + 4 + 4);
+            // ── Шаг B: Запуск DNS-прокси (C# замена MinHook хуков) ───────────
+            // Порядок критичен: сначала настраиваем систему, потом запускаем прокси
             try
             {
-                Marshal.WriteIntPtr(configPtr, 0, ppStrings);
-                Marshal.WriteInt32(configPtr, IntPtr.Size, whitelistCount);
-                Marshal.WriteInt32(configPtr, IntPtr.Size + 4, (int)config.UsbPolicy);
+                // 1. Отключаем DoH в браузерах (иначе запросы пойдут мимо порта 53)
+                NetworkManager.DisableBrowserDoH();
 
-                bool ok = NativeApi.StartSession(configPtr);
-                if (!ok)
-                    throw new InvalidOperationException(
-                        "MonitoringCore: StartSession вернул FALSE.");
+                // 2. Запускаем UDP DNS-сервер на 127.0.0.1:53
+                _dnsProxy?.Dispose();
+                _dnsProxy = new LocalDnsProxy();
+                _dnsProxy.Start(config.DnsWhitelist, OnDnsProxyAlert);
+
+                // 3. Переключаем DNS системы на наш прокси
+                NetworkManager.SetDnsToLocalProxy();
+
+                // 4. Очищаем DNS-кэш, чтобы запросы пошли заново
+                NetworkManager.FlushDnsCache();
             }
-            finally
+            catch (Exception ex)
             {
-                // Освобождаем временные буферы (C++ скопировал данные в Start())
-                Marshal.FreeHGlobal(configPtr);
-                if (ppStrings != IntPtr.Zero)
-                    Marshal.FreeHGlobal(ppStrings);
-                foreach (IntPtr p in strPointers)
-                    Marshal.FreeHGlobal(p);
+                // При ошибке — откатываем все изменения, чтобы не "сломать" интернет
+                NetworkManager.EmergencyRestore();
+                _dnsProxy?.Dispose();
+                _dnsProxy = null;
+                throw new InvalidOperationException(
+                    $"DNS Proxy: ошибка запуска — {ex.Message}", ex);
             }
         }
 
@@ -364,6 +382,29 @@ namespace MonitoringCore
         public void StopSession()
         {
             if (!_initialized) return;
+
+            // ── Останавливаем DNS-прокси (C#) ────────────────────────────────
+            // Порядок: сначала восстанавливаем DNS → потом останавливаем прокси
+            // (иначе запросы пойдут на 127.0.0.1:53, где уже никто не слушает)
+            try
+            {
+                NetworkManager.RestoreDns();
+                NetworkManager.RestoreBrowserDoH();
+                NetworkManager.FlushDnsCache();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Wrapper] Ошибка восстановления DNS: {ex.Message}");
+            }
+
+            if (_dnsProxy != null)
+            {
+                _dnsProxy.StopAsync().GetAwaiter().GetResult();
+                _dnsProxy.Dispose();
+                _dnsProxy = null;
+            }
+
+            // ── Останавливаем C++ модули (USB) ───────────────────────────────
             NativeApi.StopSession();
         }
 
@@ -388,18 +429,24 @@ namespace MonitoringCore
         {
             if (!_initialized) return "{}";
 
-            const int BufferSize = 65536; // 64 KB — достаточно для отчёта любой сессии
+            // ── Отчёт от C++ (USB) ───────────────────────────────────────────
+            const int BufferSize = 65536;
             byte[] buffer = new byte[BufferSize];
 
+            string usbReport = "{}";
             bool ok = NativeApi.GetSessionReport(buffer, BufferSize);
-            if (!ok) return "{ \"error\": \"buffer too small\" }";
+            if (ok)
+            {
+                int length = Array.IndexOf(buffer, (byte)0);
+                if (length < 0) length = BufferSize;
+                usbReport = Encoding.UTF8.GetString(buffer, 0, length);
+            }
 
-            // Ищем нуль-терминатор и конвертируем UTF-8 → string
-            int length = Array.IndexOf(buffer, (byte)0);
-            if (length < 0) length = BufferSize;
+            // ── Отчёт от DNS-прокси (C#) ─────────────────────────────────────
+            string dnsReport = _dnsProxy?.GetReport() ?? "{}";
 
-            return Encoding.UTF8.GetString(buffer, 0, length);
-        }
+            // Объединяем в единый JSON
+            return $"{{\n  \"dns\": {dnsReport},\n  \"usb\": {usbReport}\n}}";
 
         // =====================================================================
         // IDisposable — шаг 4 (финальный)
@@ -414,15 +461,33 @@ namespace MonitoringCore
             if (_disposed) return;
             _disposed = true;
 
+            // ── Аварийное восстановление DNS (на случай если StopSession не вызван) ──
+            try
+            {
+                NetworkManager.EmergencyRestore();
+            }
+            catch { /* ignore — мы в финализаторе */ }
+
+            // ── Останавливаем DNS-прокси ─────────────────────────────────────
+            if (_dnsProxy != null)
+            {
+                try
+                {
+                    _dnsProxy.StopAsync().GetAwaiter().GetResult();
+                    _dnsProxy.Dispose();
+                }
+                catch { /* ignore */ }
+                _dnsProxy = null;
+            }
+
+            // ── Останавливаем C++ модули ─────────────────────────────────────
             if (_initialized)
             {
-                NativeApi.StopSession();       // На случай если сессия ещё активна
-                NativeApi.ShutdownModules();   // Снимаем хуки, освобождаем MinHook
+                NativeApi.StopSession();
+                NativeApi.ShutdownModules();
                 _initialized = false;
             }
 
-            // После ShutdownModules коллбек уже не будет вызываться —
-            // теперь безопасно "отпустить" делегат
             _pinnedCallback = null;
         }
 
@@ -438,15 +503,41 @@ namespace MonitoringCore
         {
             try
             {
-                // Создаём управляемый объект — безопасно для передачи в UI-поток
                 var evt = new MonitoringEvent(nativeEvt);
-                OnEvent?.Invoke(evt); // подписчики сами делают BeginInvoke если нужно
+                OnEvent?.Invoke(evt);
             }
             catch
             {
                 // Исключения из коллбека нельзя "пробрасывать" в C++ —
-                // проглатываем их здесь. В продакшене — логировать в файл.
+                // проглатываем их здесь.
             }
+        }
+
+        // =====================================================================
+        // Обработчик алертов от DNS-прокси (C#)
+        // =====================================================================
+
+        /// <summary>
+        /// Вызывается из LocalDnsProxy при блокировке DNS-запроса.
+        /// Конвертирует алерт в MonitoringEvent и прокидывает через OnEvent.
+        /// </summary>
+        private void OnDnsProxyAlert(AlertLevel level, string message, string details)
+        {
+            try
+            {
+                // Создаём псевдо-нативное событие для единообразия с USB-событиями
+                var nativeEvt = new NativeSystemEvent
+                {
+                    Module    = ModuleType.Dns,
+                    Level     = level,
+                    Timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Message   = message?.Length > 255 ? message.Substring(0, 255) : message ?? "",
+                    Details   = details?.Length > 1023 ? details.Substring(0, 1023) : details ?? "{}"
+                };
+                var evt = new MonitoringEvent(nativeEvt);
+                OnEvent?.Invoke(evt);
+            }
+            catch { /* проглатываем — алерт не должен ронять приложение */ }
         }
     }
 }
